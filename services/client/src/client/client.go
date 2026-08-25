@@ -1,24 +1,25 @@
 package client
 
 import (
+	"bufio"
+	"errors"
 	"net"
+	"os"
 	"time"
 
 	"github.com/7574-sistemas-distribuidos/tp-nivelador/src/logger"
 	"github.com/7574-sistemas-distribuidos/tp-nivelador/src/safe_socket"
 )
 
-const CONNECTION_ATTEMPTS_MAX = 3
-const CONNECTION_ATTEMPS_DELAY_MS = 200
-
-const ECHO_CLIENT_BUFFER_SIZE = 512
-const ECHO_CLIENT_MESSAGE_AMOUNT = 3
-const ECHO_CLIENT_MESSAGE_DELAY_MS = 1000
+const ConnectionAttemptsMax = 3
+const ConnectionAttempsDelayMs = 200
 
 type ClientConfig struct {
 	ServerHost string
 	ServerPort string
 	AgencyId   string
+	InputFile  string
+	OutputFile string
 }
 
 type Client struct {
@@ -43,11 +44,11 @@ func connectToServer(host, port string) (net.Conn, error) {
 	var conn net.Conn
 
 	logger.Info(action, logger.InProgress)
-	for i := range CONNECTION_ATTEMPTS_MAX {
+	for i := range ConnectionAttemptsMax {
 		conn, err = net.Dial("tcp", host+":"+port)
 		if err != nil {
 			logger.Warn(action, logger.Fail, "attempt", i)
-			time.Sleep(CONNECTION_ATTEMPS_DELAY_MS * time.Millisecond)
+			time.Sleep(ConnectionAttempsDelayMs * time.Millisecond)
 			continue
 		}
 
@@ -58,35 +59,78 @@ func connectToServer(host, port string) (net.Conn, error) {
 	return conn, err
 }
 
-func (client *Client) Run() error {
-	const mainAction = "test-echo-server"
-	defer client.conn.Close()
+func (client *Client) closeConnection(err *error) {
+	closeErr := client.conn.Close()
+	if closeErr != nil {
+		logger.Error("close-connection", logger.Fail, "error", closeErr)
+		*err = errors.Join(*err, closeErr)
+		return
+	}
+	return
+}
 
-	for messageId := range ECHO_CLIENT_MESSAGE_AMOUNT {
-		messageArgs := []any{"agency-id", client.config.AgencyId, "message-id", messageId}
-		logger.Info(mainAction, logger.InProgress, messageArgs...)
+func (client *Client) closeFile(file *os.File, err *error) {
+	closeErr := file.Close()
+	if closeErr != nil {
+		logger.Error("close-input-file", logger.Fail, "path", file.Name(), "error", closeErr)
+		*err = errors.Join(*err, closeErr)
+		return
+	}
+	return
+}
 
-		clientMessage := client.config.AgencyId
+func (client *Client) flushFile(writer *bufio.Writer, err *error) {
+	flushErr := writer.Flush()
+	if flushErr != nil {
+		logger.Warn("flush-file", logger.Fail, "error", flushErr)
+		*err = errors.Join(*err, flushErr)
+	}
+}
+
+func (client *Client) Run() (err error) {
+	defer client.closeConnection(&err)
+
+	inputFile, err := os.Open(client.config.InputFile)
+	if err != nil {
+		logger.Error("open-input-file", logger.Fail, "path", client.config.InputFile, "error", err)
+		return err
+	}
+	defer client.closeFile(inputFile, &err)
+
+	outputFile, err := os.Create(client.config.OutputFile)
+	if err != nil {
+		logger.Error("create-output-file", logger.Fail, "path", client.config.OutputFile, "err", err)
+		return err
+	}
+	defer client.closeFile(outputFile, &err)
+
+	scanner := bufio.NewScanner(inputFile)
+	writer := bufio.NewWriter(outputFile)
+	defer client.flushFile(writer, &err)
+
+	for messageId := 0; scanner.Scan(); messageId++ {
+		logger.Info("send-input-file", logger.InProgress)
+		clientMessage := scanner.Text()
+		messageArgs := []any{"message", clientMessage, "message-id", messageId}
 
 		if err := safe_socket.SendAll(client.conn, []byte(clientMessage)); err != nil {
 			logger.Error("send-message", logger.Fail, messageArgs...)
 			return err
 		}
-
-		responseBuffer, err := safe_socket.RecvAll(client.conn, ECHO_CLIENT_BUFFER_SIZE)
+		responseBuffer, err := safe_socket.RecvAll(client.conn, len(clientMessage))
 		if err != nil {
 			logger.Error("recv-response", logger.Fail, messageArgs...)
 			return err
 		}
-
 		if string(responseBuffer) != clientMessage {
 			logger.Error("check-response", logger.Fail, messageArgs...)
 			return err
 		}
-
-		time.Sleep(ECHO_CLIENT_MESSAGE_DELAY_MS * time.Millisecond)
+		if _, err := writer.Write(append(responseBuffer, '\n')); err != nil {
+			logger.Error("write-response", logger.Fail, messageArgs...)
+			return err
+		}
 	}
-	logger.Info(mainAction, logger.Success, "agency-id", client.config.AgencyId)
-
+	logger.Info("send-input-file", logger.Success)
 	return nil
 }
