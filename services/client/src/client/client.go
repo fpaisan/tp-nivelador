@@ -3,6 +3,7 @@ package client
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"time"
@@ -87,6 +88,19 @@ func (client *Client) flushFile(writer *bufio.Writer, err *error) {
 	}
 }
 
+func (client *Client) sendAndRecvResponse(message []byte, messageArgs []any) ([]byte, error) {
+	if err := safe_socket.SendAll(client.conn, message); err != nil {
+		logger.Error("send-message", logger.Fail, messageArgs...)
+		return nil, err
+	}
+	responseBuffer, err := safe_socket.RecvAll(client.conn, len(message))
+	if err != nil {
+		logger.Error("recv-response", logger.Fail, messageArgs...)
+		return nil, err
+	}
+	return responseBuffer, nil
+}
+
 func (client *Client) Run() (err error) {
 	defer client.closeConnection(&err)
 
@@ -113,23 +127,22 @@ func (client *Client) Run() (err error) {
 		clientMessage := scanner.Text()
 		messageArgs := []any{"message", clientMessage, "message-id", messageId}
 
-		if err := safe_socket.SendAll(client.conn, []byte(clientMessage)); err != nil {
-			logger.Error("send-message", logger.Fail, messageArgs...)
-			return err
-		}
-		responseBuffer, err := safe_socket.RecvAll(client.conn, len(clientMessage))
+		responseBuffer, err := client.sendAndRecvResponse([]byte(clientMessage), messageArgs)
 		if err != nil {
-			logger.Error("recv-response", logger.Fail, messageArgs...)
 			return err
 		}
 		if string(responseBuffer) != clientMessage {
 			logger.Error("check-response", logger.Fail, messageArgs...)
-			return err
+			return fmt.Errorf("invalid response: expected %s, got %s", clientMessage, responseBuffer)
 		}
 		if _, err := writer.Write(append(responseBuffer, '\n')); err != nil {
 			logger.Error("write-response", logger.Fail, messageArgs...)
 			return err
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		logger.Error("read-file", logger.Fail, "path", client.config.InputFile, "error", err)
+		return err
 	}
 	logger.Info("send-input-file", logger.Success)
 	return nil
